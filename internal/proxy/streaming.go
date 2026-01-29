@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/lich0821/ccNexus/internal/config"
 	"github.com/lich0821/ccNexus/internal/logger"
+	"github.com/lich0821/ccNexus/internal/tokencount"
 	"github.com/lich0821/ccNexus/internal/transformer"
 	"github.com/lich0821/ccNexus/internal/transformer/cc"
 	"github.com/lich0821/ccNexus/internal/transformer/cx/chat"
@@ -85,6 +87,39 @@ func (p *Proxy) handleStreamingResponse(w http.ResponseWriter, resp *http.Respon
 		}
 
 		if strings.Contains(line, "data: [DONE]") {
+			// Fallback: update output_tokens if not provided
+			if outputTokens == 0 && outputText.String() != "" {
+				outputTokens = tokencount.EstimateOutputTokens(outputText.String())
+				logger.Debug("[%s] Estimated output tokens: %d", endpoint.Name, outputTokens)
+			}
+
+			if streamCtx != nil {
+				streamCtx.OutputTokens = outputTokens
+				streamCtx.InputTokens = inputTokens
+			}
+
+			// Create message_delta to output
+			deltaEvent := map[string]interface{}{
+				"type": "message_delta",
+				"delta": map[string]interface{}{
+					"stop_reason":   "end_turn",
+					"stop_sequence": nil,
+				},
+				"usage": map[string]interface{}{
+					"output_tokens": outputTokens,
+				},
+			}
+			deltaData, _ := json.Marshal(deltaEvent)
+			deltaSSE := fmt.Sprintf("data: %s\n\n", deltaData)
+
+			// Transform the event
+			transformedDelta, _ := p.transformStreamEvent([]byte(deltaSSE), trans, transformerName, streamCtx)
+			if len(transformedDelta) > 0 {
+				logger.DebugLog("[%s] SSE Event with output_tokens: %s", endpoint.Name, string(transformedDelta))
+				w.Write(transformedDelta)
+				flusher.Flush()
+			}
+
 			streamDone = true
 			buffer.WriteString(line + "\n")
 			eventData := buffer.Bytes()
